@@ -19,6 +19,9 @@
 #include <cmath>
 #include <memory>
 
+// 0.07s
+#define DELTA_THRESHOLD 70000
+
 namespace iptsd::apps::daemon {
 
 class StylusDevice {
@@ -38,6 +41,15 @@ private:
 
 	// The last known state of the stylus.
 	ipts::samples::Stylus m_last;
+
+	// The high resolution time of last stylus rising.
+	std::optional<std::chrono::time_point<std::chrono::high_resolution_clock>> last_rise_time = std::nullopt;
+
+	// The queue of events fired between last stylus tip rising and DELTA_THRESHOLD microseconds.
+	std::list<ipts::samples::Stylus> events_queue;
+
+	// Whether the events_queue is being currently processed or not.
+	bool is_processing_queue = false;
 
 public:
 	StylusDevice(const core::Config &config, const core::DeviceInfo &info)
@@ -86,6 +98,59 @@ public:
 		// Switching tools within one frame causes issues, lift the stylus for one frame.
 		if (m_last.rubber != data.rubber)
 			m_active = false;
+
+		if (m_active && !is_processing_queue) {
+			// We know when the stylus tip was risen
+			if (auto start = last_rise_time) {
+				events_queue.push_back(data);
+
+				// Let's check how many microseconds have the tip been risen for
+				auto elapsed = std::chrono::high_resolution_clock::now() - *start;
+				long long delta = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+
+				// D C What to do?
+				// < + run the queue ignoring the contact loss, reset counter
+				// < - ignore
+				// > + run the queue without changes, reset counter
+				// > - run the queue without changes, reset counter
+
+				if (delta > DELTA_THRESHOLD) {
+					// Run the queue
+					is_processing_queue = true;
+					for (auto data : events_queue) {
+						update(data);
+					}
+					events_queue.clear();
+					is_processing_queue = false;
+
+					last_rise_time = std::nullopt;
+					return;
+				}
+
+				// There is no contact, we've already pushed the event to the queue, let's ignore it
+				if (!data.contact) return;
+
+				// Run the queue ignoring the contact loss
+				is_processing_queue = true;
+				for (auto data : events_queue) {
+					data.contact = true;
+					if (data.pressure == 0.0) data.pressure = 0.1;
+					update(data);
+				}
+				events_queue.clear();
+				is_processing_queue = false;
+
+				last_rise_time = std::nullopt;
+				return;
+			}
+
+			// This is the first time when the tip is being risen
+			else if (!data.contact && m_last.contact) {
+				last_rise_time = std::chrono::high_resolution_clock::now();
+				events_queue.push_back(data);
+				return;
+			}
+		}
 
 		if (m_active) {
 			const Vector2<i32> tilt = calculate_tilt(data.altitude, data.azimuth);
