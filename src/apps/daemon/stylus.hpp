@@ -19,9 +19,6 @@
 #include <cmath>
 #include <memory>
 
-// 0.07s
-#define DELTA_THRESHOLD 70000
-
 namespace iptsd::apps::daemon {
 
 class StylusDevice {
@@ -42,18 +39,23 @@ private:
 	// The last known state of the stylus.
 	ipts::samples::Stylus m_last;
 
-	// The high resolution time of last stylus rising.
-	std::optional<std::chrono::time_point<std::chrono::high_resolution_clock>> last_rise_time = std::nullopt;
+	// The high resolution time of last stylus lift.
+	std::optional<std::chrono::time_point<std::chrono::high_resolution_clock>> last_lift_time = std::nullopt;
 
-	// The queue of events fired between last stylus tip rising and DELTA_THRESHOLD microseconds.
+	// The queue of events fired between last stylus tip lift and lift_timeout seconds.
 	std::list<ipts::samples::Stylus> events_queue;
 
 	// Whether the events_queue is being currently processed or not.
 	bool is_processing_queue = false;
 
+	// The timeout for lifting the stylus tip.
+	u32 lift_timeout = 0;
+
 public:
 	StylusDevice(const core::Config &config, const core::DeviceInfo &info)
 	{
+		lift_timeout = casts::to<u32>(config.stylus_lift_timeout * 1000000);
+
 		m_uinput->set_name("Stylus");
 		m_uinput->set_vendor(info.vendor);
 		m_uinput->set_product(info.product);
@@ -99,12 +101,12 @@ public:
 		if (m_last.rubber != data.rubber)
 			m_active = false;
 
-		if (m_active && !is_processing_queue) {
-			// We know when the stylus tip was risen
-			if (auto start = last_rise_time) {
+		if (m_active && lift_timeout != 0 && !is_processing_queue) {
+			// We know when the stylus tip was lifted
+			if (auto start = last_lift_time) {
 				events_queue.push_back(data);
 
-				// Let's check how many microseconds have the tip been risen for
+				// Let's check how many microseconds have the tip been lifted for
 				auto elapsed = std::chrono::high_resolution_clock::now() - *start;
 				long long delta = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
 
@@ -114,7 +116,7 @@ public:
 				// > + run the queue without changes, reset counter
 				// > - run the queue without changes, reset counter
 
-				if (delta > DELTA_THRESHOLD) {
+				if (delta > lift_timeout) {
 					// Run the queue
 					is_processing_queue = true;
 					for (auto data : events_queue) {
@@ -123,7 +125,7 @@ public:
 					events_queue.clear();
 					is_processing_queue = false;
 
-					last_rise_time = std::nullopt;
+					last_lift_time = std::nullopt;
 					return;
 				}
 
@@ -140,13 +142,14 @@ public:
 				events_queue.clear();
 				is_processing_queue = false;
 
-				last_rise_time = std::nullopt;
+				last_lift_time = std::nullopt;
 				return;
 			}
 
-			// This is the first time when the tip is being risen
+			// This is the first time when the tip is being
+			// lifted
 			else if (!data.contact && m_last.contact) {
-				last_rise_time = std::chrono::high_resolution_clock::now();
+				last_lift_time = std::chrono::high_resolution_clock::now();
 				events_queue.push_back(data);
 				return;
 			}
